@@ -184,6 +184,48 @@ class NewsIntel(Base):
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
 
 
+class JiuyangongsheIntel(Base):
+    """
+    韭研公社情报数据模型
+
+    存储从韭研公社 APP API 抓取的盘前纪要、复盘内容、涨停简图等情报。
+    由定时任务在每个交易日 09:10（盘前）和 22:00（复盘）自动抓取。
+    """
+    __tablename__ = 'jiuyangongshe_intel'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # 文章标识
+    article_id = Column(String(64), nullable=False, unique=True, index=True)
+
+    # 内容摘要
+    title = Column(String(300), nullable=False)
+    content = Column(Text, default="")
+    create_time = Column(String(32), default="")  # 文章原始发布时间
+
+    # 类型：premarket / review
+    article_type = Column(String(32), nullable=False, index=True)
+
+    # 关联股票（JSON 字符串存储）
+    stocks = Column(Text, default="[]")  # JSON: [{"name": "宁德时代", "code": "sz300750"}]
+
+    # 涨停简图 URL（单独存，非文章）
+    diagram_url = Column(String(500), default="")
+
+    # 入库时间
+    fetched_at = Column(DateTime, default=datetime.now, index=True)
+
+    # 来源标记
+    source = Column(String(32), default="jiuyangongshe")
+
+    __table_args__ = (
+        Index('ix_jiuyangong_type_time', 'article_type', 'create_time'),
+    )
+
+    def __repr__(self) -> str:
+        return f"<JiuyangongsheIntel(id={self.id}, article_id={self.article_id}, type={self.article_type})>"
+
+
 class FundamentalSnapshot(Base):
     """
     基本面上下文快照（P0 write-only）。
@@ -1167,6 +1209,84 @@ class DatabaseManager:
                     desc(NewsIntel.fetched_at)
                 )
                 .limit(limit)
+            ).scalars().all()
+
+            return list(results)
+
+    def save_jiuyangongshe_intel(
+        self,
+        article_id: str,
+        title: str,
+        content: str = "",
+        create_time: str = "",
+        article_type: str = "",
+        stocks: str = "[]",
+        diagram_url: str = "",
+    ) -> int:
+        """
+        保存韭研公社情报到数据库（upsert，按 article_id 去重）
+
+        Returns:
+            新增数量（0=已存在，1=新增）
+        """
+        def _write(session: Session) -> int:
+            existing = session.execute(
+                select(JiuyangongsheIntel)
+                .where(JiuyangongsheIntel.article_id == article_id)
+            ).scalars().first()
+
+            if existing:
+                existing.title = title
+                existing.content = content
+                existing.create_time = create_time
+                existing.article_type = article_type
+                existing.stocks = stocks
+                if diagram_url:
+                    existing.diagram_url = diagram_url
+                return 0
+
+            record = JiuyangongsheIntel(
+                article_id=article_id,
+                title=title,
+                content=content,
+                create_time=create_time,
+                article_type=article_type,
+                stocks=stocks,
+                diagram_url=diagram_url,
+            )
+            session.add(record)
+            return 1
+
+        return self._run_write_transaction(
+            f"save_jiuyangongshe_intel[{article_id}]",
+            _write,
+        )
+
+    def get_jiuyangongshe_intel(
+        self,
+        article_type: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[JiuyangongsheIntel]:
+        """
+        查询韭研公社情报
+
+        Args:
+            article_type: premarket / review / industry / digest
+            stock_code: 按关联股票代码筛选（模糊匹配 stocks JSON 字段）
+            limit: 返回数量
+        """
+        with self.get_session() as session:
+            query = select(JiuyangongsheIntel)
+
+            if article_type:
+                query = query.where(JiuyangongsheIntel.article_type == article_type)
+
+            if stock_code:
+                query = query.where(JiuyangongsheIntel.stocks.like(f'%{stock_code}%'))
+
+            results = session.execute(
+                query.order_by(desc(JiuyangongsheIntel.fetched_at)).limit(limit)
             ).scalars().all()
 
             return list(results)

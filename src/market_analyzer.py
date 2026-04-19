@@ -23,6 +23,7 @@ from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
+from src.services.jiuyangongshe_service import JiuyangongsheService
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -399,13 +400,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         return all_news
     
-    def generate_market_review(self, overview: MarketOverview, news: List) -> str:
+    def generate_market_review(self, overview: MarketOverview, news: List, jiuyangongshe_content: str = "") -> str:
         """
         使用大模型生成大盘复盘报告
         
         Args:
             overview: 市场概览数据
             news: 市场新闻列表 (SearchResult 对象列表)
+            jiuyangongshe_content: 韭研公社情报内容（可选）
             
         Returns:
             大盘复盘报告文本
@@ -415,7 +417,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return self._generate_template_review(overview, news)
         
         # 构建 Prompt
-        prompt = self._build_review_prompt(overview, news)
+        prompt = self._build_review_prompt(overview, news, jiuyangongshe_content)
         
         logger.info("[大盘] 调用大模型生成复盘报告...")
         # Use the public generate_text() entry point — never access private analyzer attributes.
@@ -547,7 +549,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append(f"> 💧 领跌: {bot}")
         return "\n".join(lines)
 
-    def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
+    def _build_review_prompt(self, overview: MarketOverview, news: List, jiuyangongshe_content: str = "") -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
 
@@ -623,6 +625,7 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
         else:
             indices_placeholder = indices_text if indices_text else "暂无指数数据（接口异常）"
             news_placeholder = news_text if news_text else "暂无相关新闻"
+            jiuyangongshe_placeholder = jiuyangongshe_content if jiuyangongshe_content else "（暂无韭研公社情报）"
 
         if review_language == "en":
             report_title = self._get_review_title(overview.date).removeprefix("## ").strip()
@@ -713,6 +716,9 @@ Output the report content directly, no extra commentary.
 
 ## 市场新闻
 {news_placeholder}
+
+## 韭研公社情报
+{jiuyangongshe_placeholder}
 
 {data_no_indices_hint}
 
@@ -882,8 +888,21 @@ Market conditions can change quickly. The data above is for reference only and d
         # 2. 搜索市场新闻
         news = self.search_market_news()
         
-        # 3. 生成复盘报告
-        report = self.generate_market_review(overview, news)
+        # 3. 获取韭研公社情报（仅 A 股）
+        jiuyangongshe_content = ""
+        if self.region == 'cn':
+            try:
+                svc = JiuyangongsheService()
+                content = svc.fetch_content()
+                if content:
+                    jiuyangongshe_content = svc.format_for_prompt(content)
+                    logger.info("[韭研公社] 获取情报成功: 盘前 %d 条, 复盘 %d 条",
+                                len(content.premarket), len(content.review))
+            except Exception as e:
+                logger.warning("[韭研公社] 获取情报失败: %s", e)
+        
+        # 4. 生成复盘报告
+        report = self.generate_market_review(overview, news, jiuyangongshe_content)
         
         logger.info("========== 大盘复盘分析完成 ==========")
         

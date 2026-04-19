@@ -443,6 +443,10 @@ class Config:
     longbridge_app_secret: Optional[str] = None
     longbridge_access_token: Optional[str] = None
 
+    # === 韭研公社配置 ===
+    jiuyangongshe_phone: Optional[str] = None
+    jiuyangongshe_password: Optional[str] = None
+
     # === AI 分析配置 ===
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-2.5-flash)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
@@ -1115,6 +1119,8 @@ class Config:
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
             longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,
+            jiuyangongshe_phone=os.getenv('JIUYANGONGSHE_PHONE') or None,
+            jiuyangongshe_password=os.getenv('JIUYANGONGSHE_PASSWORD') or None,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -2333,6 +2339,9 @@ def extra_litellm_params(model: str, config: Config) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     # deepseek/ provider: litellm auto-resolves api_base, no manual override needed
     if model.startswith("deepseek/"):
+        return params
+    if model.startswith("minimax/"):
+        params["api_base"] = "https://api.minimax.chat/v1"
         return params
     if model.startswith("openai/") or "/" not in model:
         if config.openai_base_url:
