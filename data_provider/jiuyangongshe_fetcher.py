@@ -108,6 +108,19 @@ _STRATEGY_EXPIRES = "2026-08-31T16:00:00Z"  # 过期前 fetcher 都可用
 
 
 # === Token 算法 + ts 校准 ===
+#
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ 重要: AES 与 MD5 算法使用不同的 timestamp 格式                    ║
+# ╠══════════════════════════════════════════════════════════════════════╣
+# ║ AES  (Frida SDK 实际行为)   - ISO 字符串   "2026-08-25T01:30:00Z" ║
+# ║ MD5  (Mingdi 实际行为)    - 毫秒数字   "1787674931900"             ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# 踩坑记录: fetcher 之前 MD5 fallback 用 ISO ts → 服务端返 110(格式不对)
+# 当时以为服务端"用不同 SECRET 拒绝",实际 ts 格式错了就 fail
+# 修 _get_display_ts() 根据 algorithm 自动选 ISO 还是毫秒,不再踩
+# 详细: 2026-08-25 调试 Mingdi 仓库 (Mingdi-hub/jiuyan-stock-sentiment-skill)
+
 # 当前算法 (main): Frida hook 拿到的 AES strategy
 def _compute_jys_token_aes(timestamp_iso: str) -> str:
     """主算法 - 本地 AES-CBC-128 算 token(服务端校验通过,与 Frida SDK 算法一致)"""
@@ -133,8 +146,9 @@ def _compute_jys_token_md5(timestamp_iso: str = None) -> str:
         SECRET = "Uu0KfOB8iUP69d3c"
         算法    = MD5(SECRET + ":" + 毫秒时间戳)
 
-    实测可用! fetcher 之前 MD5 fallback fail 是因为 ISO ts 跟服务端预期不符。
-    Mingdi 跟 fetcher 用同 SECRET 但用毫秒 ts - 服务端要的是毫秒数字字符串。
+    ⚠️ 关键: timestamp header 必须是毫秒数字字符串 (不是 ISO 字符串!)
+       例如: timestamp="1787674931900", 不是 "2026-08-25T01:30:00Z"
+       _get_display_ts("md5", ts_iso) 帮你自动转换
 
     用途:
     - 适用于 app-api.jiuyangongshe.com (APP API)
@@ -154,11 +168,18 @@ _fetcher_state_cache = None
 
 
 def _get_display_ts(algorithm: str, timestamp_iso: str) -> str:
-    """返回 header 用的 timestamp 字符串
+    """根据算法返回 header 用的 timestamp 字符串
 
-    AES 算法用 ISO timestamp string
-    MD5 算法用毫秒数字 string(Mingdi 行为)
+    重要! 不同算法用不同 ts 格式:
+      - AES 算法: ISO 字符串,如 "2026-08-25T01:30:00Z" (Frida SDK 实际行为)
+      - MD5 算法: 毫秒数字字符串,如 "1787674931900" (Mingdi 实际行为)
+    不要在 MD5 算法路径用 ISO ts,服务端会返 110 token 无效。
     """
+    if algorithm == "md5":
+        from datetime import datetime as _dt
+        dt = _dt.strptime(timestamp_iso, "%Y-%m-%dT%H:%M:%SZ")
+        return str(int(dt.timestamp() * 1000))
+    return timestamp_iso
     if algorithm == "md5":
         from datetime import datetime as _dt
         dt = _dt.strptime(timestamp_iso, "%Y-%m-%dT%H:%M:%SZ")
