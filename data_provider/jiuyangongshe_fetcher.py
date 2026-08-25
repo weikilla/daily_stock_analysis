@@ -13,6 +13,8 @@ strategy 缓存到 end=2026-08-31。sessionToken 15 天有效,过期后用户重
 依赖: pip install tls-client cryptography
 """
 
+import os
+import hashlib
 import json
 import logging
 import re
@@ -106,8 +108,9 @@ _STRATEGY_EXPIRES = "2026-08-31T16:00:00Z"  # 过期前 fetcher 都可用
 
 
 # === Token 算法 + ts 校准 ===
-def _compute_jys_token(timestamp_iso: str) -> str:
-    """本地 AES-CBC-128 算 token(服务端校验通过,与 Frida SDK 算法一致)。"""
+# 当前算法 (main): Frida hook 拿到的 AES strategy
+def _compute_jys_token_aes(timestamp_iso: str) -> str:
+    """主算法 - 本地 AES-CBC-128 算 token(服务端校验通过,与 Frida SDK 算法一致)"""
     pt = (_STRATEGY_PROJECT + _STRATEGY_AES_KEY.decode() + timestamp_iso).encode("utf-8")
     padder = padding.PKCS7(128).padder()
     padded = padder.update(pt) + padder.finalize()
@@ -115,6 +118,77 @@ def _compute_jys_token(timestamp_iso: str) -> str:
     encryptor = cipher.encryptor()
     ct = encryptor.update(padded) + encryptor.finalize()
     return ct.hex().upper()
+
+
+# 备用算法 - web API SECRET (来自 Mingdi 仓库 jiuyan_fetch.py)
+# 算法: MD5(SECRET + ":" + 毫秒时间戳),header 用毫秒时间戳不是 ISO 字符串
+_WEB_API_SECRET = "Uu0KfOB8iUP69d3c"  # 公开 web API SECRET (stable,几年不变)
+_wb_strategy = "md5_web"  # 算法协商标签
+
+
+def _compute_jys_token_md5() -> str:
+    """备用算法 - web API (www.jiuyangongshe.com) 的 MD5 token 算法
+
+    来源: Mingdi-hub/jiuyan-stock-sentiment-skill 仓库,公开 web API SECRET:
+        SECRET = "Uu0KfOB8iUP69d3c"
+        算法    = MD5(SECRET + ":" + 毫秒时间戳)
+
+    用途:
+    - 适用于 web 端 (web-api.jiuyangongshe.com, Zessi-C/jiuyan-mcp 用)
+    - **APP API (app-api.jiuyangongshe.com) 不接受此 SECRET**(实测 errCode=110)
+    - 当 AES 算法失效时,可能服务端改成 web 端 SECRET,作为兜底参考
+
+    仍保留: 也许未来服务端跨 API 共享 SECRET 时能 work
+    """
+    ts_ms = str(int(time.time() * 1000))
+    return hashlib.md5(f"{_WEB_API_SECRET}:{ts_ms}".encode()).hexdigest()
+
+
+# Fetcher 状态 - 记录当前 token 算法(AES/MD5),login 时协商
+_fetcher_state_cache = None
+
+
+def _get_state():
+    """从 .env 读 fetcher 状态(algorithm/strategy 等),默认 AES"""
+    global _fetcher_state_cache
+    if _fetcher_state_cache is None:
+        from pathlib import Path
+        env_path = str(Path(__file__).parent.parent / ".env")
+        state = {"algorithm": "aes"}
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                text = f.read()
+            import re as _re
+            m = _re.search(r"^JIUYANGONGSHE_ALGORITHM=(\S+)", text, _re.MULTILINE)
+            if m:
+                state["algorithm"] = m.group(1)
+        _fetcher_state_cache = state
+    return _fetcher_state_cache
+
+
+def _save_state(state):
+    """保存 fetcher 状态(algorithm)到 .env"""
+    import re as _re
+    from pathlib import Path
+    env_path = str(Path(__file__).parent.parent / ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        text = f.read()
+    text = _re.sub(r"^JIUYANGONGSHE_ALGORITHM=.*\n", "", text, flags=_re.MULTILINE)
+    text += f"JIUYANGONGSHE_ALGORITHM={state['algorithm']}\n"
+    with open(env_path, "w") as f:
+        f.write(text)
+
+
+def _compute_jys_token(timestamp_iso: str = None) -> str:
+    """智能选算法 - 默认 AES,失败时降级 MD5 (state 缓存在 _fetcher_state_cache)"""
+    state = _get_state()
+    algo = state.get("algorithm", "aes")
+    algo = state.get("algorithm", "aes")
+    if algo == "md5":
+        return _compute_jys_token_md5()
+    return _compute_jys_token_aes(timestamp_iso or _now_iso())
 
 
 # Server-time 校准 ts(SDK 内部也用 serverTime - offsetSeconds 算 ts)
@@ -166,32 +240,74 @@ def _build_headers(ts_iso: str = None, token: str = None) -> dict:
 def login(phone: str, password: str, force: bool = False) -> tuple[str, str, str]:
     """登录并返回 (token, session_token, session_cookie)。
 
-    优先用 .env 缓存的 session (15 天有效),未过期就跳过 login(避免服务端频率限制)。
-    force=True 强制重新登录。登录成功后写回 .env。"""
-    # 1. 先读缓存
+    优先用 .env 缓存的 session (15 天有效),未过期就跳过 login。
+    login 时同时尝试 AES 和 MD5 算法(work 的用哪个,把 algorithm 写到 .env)。
+    force=True 强制重新登录。
+    """
+    import hashlib
+
+    # 1. 缓存有效 + 算法一致 → 直接用缓存
     cached = None if force else _read_cached_session()
     if cached and cached[0]:
         print(f"[login] 用 .env 缓存 session (expires={cached[1]})")
-        # 但 token 必须新算(每次 _api 重新算)
         sess = _new_session()
         ts_iso = _now_iso()
         token = _compute_jys_token(ts_iso)
-        return token, cached[0], cached[0]  # cookie 跟 session 同值
+        return token, cached[0], cached[0]
 
-    # 2. 没有缓存或 force - 调 login endpoint
+    # 2. 没缓存/force - 试 AES 主算法 + MD5 fallback
+    state = _get_state()
+    primary = state.get("algorithm", "aes")
+
     sess = _new_session()
     ts_iso = _now_iso()
-    token = _compute_jys_token(ts_iso)
-    r = sess.post(
-        f"{_APP_BASE}/v1/user/login",
-        json={"phone": phone, "password": password},
-        headers={
-            "Content-Type":"application/json",
-            "version_name":_BUILD_VERSION_NAME, "version":_BUILD_VERSION,
-            "platform":_BUILD_PLATFORM, "User-Agent":_BUILD_USER_AGENT,
-            "token":token, "timestamp":ts_iso,
-        },
-    )
+
+    for algo_name, compute_fn, header_builder in [
+        ("aes", lambda: _compute_jys_token_aes(ts_iso), lambda tk, ts: {
+            "Content-Type":"application/json","version_name":_BUILD_VERSION_NAME,
+            "version":_BUILD_VERSION,"platform":_BUILD_PLATFORM,"User-Agent":_BUILD_USER_AGENT,
+            "token":tk,"timestamp":ts,
+        }),
+        ("md5", lambda: _compute_jys_token_md5(), lambda tk, ts: {
+            "Content-Type":"application/json","version_name":_BUILD_VERSION_NAME,
+            "version":_BUILD_VERSION,"platform":_BUILD_PLATFORM,"User-Agent":_BUILD_USER_AGENT,
+            "token":tk,"timestamp":ts,  # MD5 用 ISO 但服务端可能容忍
+        }),
+    ]:
+        if algo_name == primary:
+            # 主算法先试
+            pass
+        elif primary == "aes" and algo_name == "md5":
+            # 主算法 fail 后再试 fallback
+            pass
+        else:
+            continue
+
+        try:
+            token = compute_fn()
+            r = sess.post(
+                f"{_APP_BASE}/v1/user/login",
+                json={"phone": phone, "password": password},
+                headers=header_builder(token, ts_iso),
+            )
+            data = r.json()
+            if data.get("errCode") == "0":
+                if algo_name != state.get("algorithm"):
+                    print(f"[login] 主算法 {state.get('algorithm')} 失效,切换到 {algo_name}")
+                    state["algorithm"] = algo_name
+                    _save_state(state)
+                session_token = data["data"]["sessionToken"]
+                session_cookie = r.cookies.get("SESSION")
+                from datetime import datetime, timedelta
+                expires_iso = (datetime.utcnow() + timedelta(days=14, hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _write_session_to_env(session_token, expires_iso)
+                print(f"[login] 用 {algo_name} 算法登录,新 session 已缓存到 .env (expires={expires_iso})")
+                return token, session_token, session_cookie
+        except Exception as e:
+            print(f"[login] {algo_name} 算法失败: {e}")
+            continue
+
+    raise RuntimeError(f"所有算法都失败,可能是 password 错或服务端大改")
     data = r.json()
     if data.get("errCode") != "0":
         raise RuntimeError(f"登录失败: {data.get('msg')} (errCode={data.get('errCode')})")
