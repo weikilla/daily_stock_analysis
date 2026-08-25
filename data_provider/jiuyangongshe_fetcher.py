@@ -1,16 +1,18 @@
 """
-韭研公社内容抓取器（APP API 方式 + 纯 Python TLS JA3 模拟）
+韭研公社内容抓取器（APP API 方式 + 标准 requests）
 
-2026-08-25: 服务端加了 TLS JA3 + token 算法 + 强制升级墙。
+2026-08-26 更新: 移除 tls-client。实测服务端**不校验 TLS JA3 指纹**,
+标准 requests + 本地算 token 直接通过(tls-client 在 musl/aarch64 上还会段错误)。
+
+2026-08-25: 服务端加了 token 算法 + 强制升级墙。
 本 fetcher 用以下组合绕过:
-1. tls-client 模拟 OkHttp4_Android_13 JA3 指纹(代替 Python requests)
-2. 服务端实时 Date header 校准 ISO timestamp(代替本地 UTC 时钟)
+1. 服务端实时 Date header 校准 ISO timestamp(代替本地 UTC 时钟)
 3. AES-CBC-128 + IV=key + PKCS7 算法算 token(从 Frida hook d.t() 拿到的 strategy)
 4. 1.3.8 / 2026080619 / platform=0(从 Frida hook RealInterceptorChain 拿到的真实 build)
 
 strategy 缓存到 end=2026-08-31。sessionToken 15 天有效,过期后用户重跑 fetcher.login() 拿新。
 
-依赖: pip install tls-client cryptography
+依赖: pip install cryptography
 """
 
 import os
@@ -24,7 +26,7 @@ from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 
 import requests
-import tls_client
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
@@ -258,12 +260,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _new_session() -> 'tls_client.Session':
-    """新 tls_client.Session(用 okhttp4_android_13 JA3 模拟 OkHttp 客户端指纹)"""
-    return tls_client.Session(
-        client_identifier="okhttp4_android_13",
-        random_tls_extension_order=True,
-    )
+def _new_session():
+    """新 HTTP session(标准 requests — 2026-08-26 实测服务端不校验 JA3,无需指纹模拟)"""
+    return requests.Session()
 
 
 def _build_headers(ts_iso: str = None, token: str = None) -> dict:
