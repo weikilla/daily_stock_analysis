@@ -126,26 +126,44 @@ _WEB_API_SECRET = "Uu0KfOB8iUP69d3c"  # 公开 web API SECRET (stable,几年不�
 _wb_strategy = "md5_web"  # 算法协商标签
 
 
-def _compute_jys_token_md5() -> str:
-    """备用算法 - web API (www.jiuyangongshe.com) 的 MD5 token 算法
+def _compute_jys_token_md5(timestamp_iso: str = None) -> str:
+    """备用算法 - APP API 的 MD5 token 算法
 
-    来源: Mingdi-hub/jiuyan-stock-sentiment-skill 仓库,公开 web API SECRET:
+    来源: Mingdi-hub/jiuyan-stock-sentiment-skill 仓库,公开 SECRET:
         SECRET = "Uu0KfOB8iUP69d3c"
         算法    = MD5(SECRET + ":" + 毫秒时间戳)
 
-    用途:
-    - 适用于 web 端 (web-api.jiuyangongshe.com, Zessi-C/jiuyan-mcp 用)
-    - **APP API (app-api.jiuyangongshe.com) 不接受此 SECRET**(实测 errCode=110)
-    - 当 AES 算法失效时,可能服务端改成 web 端 SECRET,作为兜底参考
+    实测可用! fetcher 之前 MD5 fallback fail 是因为 ISO ts 跟服务端预期不符。
+    Mingdi 跟 fetcher 用同 SECRET 但用毫秒 ts - 服务端要的是毫秒数字字符串。
 
-    仍保留: 也许未来服务端跨 API 共享 SECRET 时能 work
+    用途:
+    - 适用于 app-api.jiuyangongshe.com (APP API)
+    - 当 AES 算法失效时(如服务端 strategy 轮换),自动降级到 MD5
     """
-    ts_ms = str(int(time.time() * 1000))
+    if timestamp_iso:
+        from datetime import datetime as _dt
+        dt = _dt.strptime(timestamp_iso, "%Y-%m-%dT%H:%M:%SZ")
+        ts_ms = str(int(dt.timestamp() * 1000))
+    else:
+        ts_ms = str(int(time.time() * 1000))
     return hashlib.md5(f"{_WEB_API_SECRET}:{ts_ms}".encode()).hexdigest()
 
 
 # Fetcher 状态 - 记录当前 token 算法(AES/MD5),login 时协商
 _fetcher_state_cache = None
+
+
+def _get_display_ts(algorithm: str, timestamp_iso: str) -> str:
+    """返回 header 用的 timestamp 字符串
+
+    AES 算法用 ISO timestamp string
+    MD5 算法用毫秒数字 string(Mingdi 行为)
+    """
+    if algorithm == "md5":
+        from datetime import datetime as _dt
+        dt = _dt.strptime(timestamp_iso, "%Y-%m-%dT%H:%M:%SZ")
+        return str(int(dt.timestamp() * 1000))
+    return timestamp_iso
 
 
 def _get_state():
@@ -181,14 +199,21 @@ def _save_state(state):
         f.write(text)
 
 
-def _compute_jys_token(timestamp_iso: str = None) -> str:
-    """智能选算法 - 默认 AES,失败时降级 MD5 (state 缓存在 _fetcher_state_cache)"""
+def _compute_jys_token(timestamp_iso: str = None):
+    """智能选算法 - 返回 (token, ts_to_send) 元组
+
+    AES 算法用 ISO timestamp string(Frida SDK 行为)
+    MD5 算法用毫秒数字 string(Mingdi 行为)
+
+    Returns:
+        (token: str, ts_iso_or_ms: str) — 传给 header 时按算法用对应格式
+    """
     state = _get_state()
     algo = state.get("algorithm", "aes")
-    algo = state.get("algorithm", "aes")
+    ts_iso = timestamp_iso or _now_iso()
     if algo == "md5":
-        return _compute_jys_token_md5()
-    return _compute_jys_token_aes(timestamp_iso or _now_iso())
+        return _compute_jys_token_md5(ts_iso)
+    return _compute_jys_token_aes(ts_iso)
 
 
 # Server-time 校准 ts(SDK 内部也用 serverTime - offsetSeconds 算 ts)
@@ -323,11 +348,17 @@ def login(phone: str, password: str, force: bool = False) -> tuple[str, str, str
     return token, session_token, session_cookie
 
 
-def _api(path: str, body: dict, session: str, cookie: str = None) -> dict:
-    """带 auth 的 POST 请求。token 用自己的 _now_iso() + _compute_jys_token 重新算 (跟 ts 配套)"""
+def _api(path: str, body: dict, session: str, cookie: str = None, phone: str = None, password: str = None) -> dict:
+    """带 auth 的 POST 请求。
+
+    - token 每次用 server-time 校准 + 自算
+    - 失败重试 1 次(优先 token 失效时重算; 登录失效时强制重新登录)
+    """
     sess = _new_session()
     ts_iso = _now_iso()
     token = _compute_jys_token(ts_iso)
+    state = _get_state()
+    hdr_ts = _get_display_ts(state.get("algorithm", "aes"), ts_iso)
     cookie_hdr = f"SESSION={cookie}; Max-Age=1296000; Path=/jystock-app; HttpOnly; SameSite=Lax" if cookie else None
     hdrs = {
         "Content-Type": "application/json",
@@ -336,12 +367,33 @@ def _api(path: str, body: dict, session: str, cookie: str = None) -> dict:
         "platform": _BUILD_PLATFORM,
         "User-Agent": _BUILD_USER_AGENT,
         "token": token,
-        "timestamp": ts_iso,
+        "timestamp": hdr_ts,
     }
     if cookie_hdr:
         hdrs["Cookie"] = cookie_hdr
     r = sess.post(f"{_APP_BASE}{path}", json=body, headers=hdrs)
-    return r.json()
+    data = r.json()
+
+    # 错误重试逻辑
+    err = data.get("errCode")
+    if err in ("1", "110") and phone and password:
+        if err == "1":
+            # 登录失效: 删缓存重新登录
+            print(f"[{path}] 登录失效,重新登录")
+            _, new_session, new_cookie = login(phone, password, force=True)
+            hdrs["Cookie"] = f"SESSION={new_cookie}; Max-Age=1296000; Path=/jystock-app; HttpOnly; SameSite=Lax"
+            hdrs["token"] = _compute_jys_token(_now_iso())
+            hdrs["timestamp"] = _get_display_ts(state.get("algorithm", "aes"), _now_iso())
+            r = sess.post(f"{_APP_BASE}{path}", json=body, headers=hdrs)
+            data = r.json()
+        elif err == "110":
+            # token 失效: 重新算
+            print(f"[{path}] token 失效,重算")
+            hdrs["token"] = _compute_jys_token(_now_iso())
+            hdrs["timestamp"] = _get_display_ts(state.get("algorithm", "aes"), _now_iso())
+            r = sess.post(f"{_APP_BASE}{path}", json=body, headers=hdrs)
+            data = r.json()
+    return data
 
 
 # === 核心接口 ===
